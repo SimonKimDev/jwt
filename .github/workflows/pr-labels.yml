@@ -1,0 +1,83 @@
+name: PR labels
+
+# Labels PRs by the files they change and the issues they close. Labels are only ever added.
+# pull_request_target gives fork PRs a token that can label; never check out or run PR code here.
+on:
+  pull_request_target:
+    types:
+    - opened
+    - synchronize
+    - edited
+    - reopened
+    - ready_for_review
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+# labeler replaces the PR's label set, so runs for the same PR must not overlap.
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Label from changed files
+      uses: actions/labeler@v7
+      with:
+        sync-labels: false
+
+    - name: Copy labels from linked issues
+      if: ${{ !cancelled() }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        # shellcheck disable=SC2016 # GraphQL variables, not shell expansions
+        result=$(gh api graphql \
+          -f owner="${REPO%/*}" \
+          -f name="${REPO#*/}" \
+          -F number="$PR_NUMBER" \
+          -f query='
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  id
+                  closingIssuesReferences(first: 25) {
+                    nodes {
+                      repository { nameWithOwner }
+                      labels(first: 50) { nodes { id name } }
+                    }
+                  }
+                }
+              }
+            }')
+
+        labels=$(jq -c --arg repo "$REPO" '
+          [.data.repository.pullRequest.closingIssuesReferences.nodes[]
+            | select(.repository.nameWithOwner == $repo)
+            | .labels.nodes[]
+            | select(.name | IN("help wanted", "question") | not)]
+          | unique_by(.id)' <<< "$result")
+
+        if [ "$labels" = "[]" ]; then
+          echo "No labels to copy."
+          exit 0
+        fi
+
+        echo "Adding labels: $(jq -r 'map(.name) | join(", ")' <<< "$labels")"
+
+        jq -n \
+          --arg id "$(jq -r '.data.repository.pullRequest.id' <<< "$result")" \
+          --argjson labels "$(jq -c 'map(.id)' <<< "$labels")" \
+          '{
+            query: "mutation($id: ID!, $labels: [ID!]!) { addLabelsToLabelable(input: {labelableId: $id, labelIds: $labels}) { clientMutationId } }",
+            variables: { id: $id, labels: $labels }
+          }' \
+          | gh api graphql --input - > /dev/null
